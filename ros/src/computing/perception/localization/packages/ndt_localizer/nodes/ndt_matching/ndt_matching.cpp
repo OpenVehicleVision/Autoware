@@ -125,6 +125,9 @@ static geometry_msgs::PoseStamped localizer_pose_msg;
 static ros::Publisher estimate_twist_pub;
 static geometry_msgs::TwistStamped estimate_twist_msg;
 
+static ros::Publisher sampled_scan_pub;
+static sensor_msgs::PointCloud2 sampled_points_msg;
+
 static double angle = 0.0;
 static double control_shift_x = 0.0;
 static double control_shift_y = 0.0;
@@ -159,6 +162,8 @@ static ros::Publisher time_ndt_matching_pub;
 static std_msgs::Float32 time_ndt_matching;
 
 static int _queue_size = 1000;
+static std::string _downsampling_method = "voxelgrid";
+static int _sample_num = 2000;
 
 static ros::Publisher ndt_stat_pub;
 static ndt_localizer::ndt_stat ndt_stat_msg;
@@ -347,12 +352,27 @@ static void scan_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 		tf::Quaternion predict_q, ndt_q, current_q, control_q, localizer_q;
 
 		pcl::PointXYZ p;
+		pcl::PointXYZ sampled_p;
 		pcl::PointCloud<pcl::PointXYZ> scan;
+		pcl::PointCloud<pcl::PointXYZ> sampled_scan;
+
+		pcl::fromROSMsg(*input, scan);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr scan_ptr(new pcl::PointCloud<pcl::PointXYZ>(scan));
+		pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_scan_ptr(new pcl::PointCloud<pcl::PointXYZ>());
+
+		int points_num = scan.points.size();
+		std::cout << "points_num: " << points_num << std::endl;
+		double *w_point = new double[points_num];
+		double *w_cumulative = new double[points_num];
+		double w_total = 0.0;
+		double w_step = 0.0;
+		int i = 0;
+		int m;
+		double c = 0.0;
 
 		current_scan_time = input->header.stamp;
 
-		pcl::fromROSMsg(*input, scan);
-
+		/*
 		if(_localizer == "velodyne"){
 			pcl::PointCloud<velodyne_pointcloud::PointXYZIR> tmp;
 			pcl::fromROSMsg(*input, tmp);
@@ -367,18 +387,64 @@ static void scan_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 				}
 			}
 		}
+		*/
 
-		pcl::PointCloud<pcl::PointXYZ>::Ptr scan_ptr(new pcl::PointCloud<pcl::PointXYZ>(scan));
-		pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_scan_ptr(new pcl::PointCloud<pcl::PointXYZ>());
+		if(_downsampling_method == "low_variance_resampling"){
+			for(pcl::PointCloud<pcl::PointXYZ>::const_iterator item = scan.begin(); item != scan.end(); item++){
+				// Calculate weight of each points.
+				w_point[i] = item->x*item->x + item->y*item->y + item->z*item->z;
+				w_cumulative[i] = w_total + w_point[i];
+				w_total += w_point[i];
+				i++;
+			}
+			w_step = w_total / _sample_num;
+
+			/*
+			std::cout << "i: " << i << std::endl;
+			std::cout << "scan.points.size():" << scan.points.size() << std::endl;
+			std::cout.setf(std::ios_base::fixed, std::ios_base::floatfield);
+			std::cout << "w_total: " << w_total << std::endl;
+			std::cout << "w_step: " << w_step << std::endl;
+*/
+			i = 0;
+			c = w_point[0];
+			for(m = 0; m < _sample_num; m++){
+				while(c < w_step*(m+1)){
+					i++;
+					c += w_point[i];
+				}
+				if(i <= points_num){
+					filtered_scan_ptr->points.push_back(scan.at(i));
+				}
+			}
+		}
+
+		if(_downsampling_method == "random_resampling"){
+			std::cout << "ramdom_resampling" << std::endl;
+			i = 0;
+			int step = points_num / _sample_num;
+			std::cout << "step: " << step << std::endl;
+			for(i = 0; i < points_num; i++){
+				if(i%step == 0){
+					filtered_scan_ptr->points.push_back(scan.at(i));
+				}
+			}
+		}
+
+		if(_downsampling_method == "voxelgrid"){
+			// Downsampling the velodyne scan using VoxelGrid filter
+			pcl::VoxelGrid<pcl::PointXYZ> voxel_grid_filter;
+			voxel_grid_filter.setLeafSize(voxel_leaf_size, voxel_leaf_size, voxel_leaf_size);
+			voxel_grid_filter.setInputCloud(scan_ptr);
+			voxel_grid_filter.filter(*filtered_scan_ptr);
+		}
 
 		Eigen::Matrix4f t(Eigen::Matrix4f::Identity()); // base_link
 		Eigen::Matrix4f t2(Eigen::Matrix4f::Identity()); // localizer
 
-		// Downsampling the velodyne scan using VoxelGrid filter
-		pcl::VoxelGrid<pcl::PointXYZ> voxel_grid_filter;
-		voxel_grid_filter.setLeafSize(voxel_leaf_size, voxel_leaf_size, voxel_leaf_size);
-		voxel_grid_filter.setInputCloud(scan_ptr);
-		voxel_grid_filter.filter(*filtered_scan_ptr);
+		filtered_scan_ptr->header.frame_id = "/velodyne";
+		pcl::toROSMsg(*filtered_scan_ptr, sampled_points_msg);
+		sampled_scan_pub.publish(sampled_points_msg);
 
 		// Setting point cloud to be aligned.
 		ndt.setInputSource(filtered_scan_ptr);
@@ -592,6 +658,8 @@ static void scan_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 			exit(1);
 		}
 		ofs_log << input->header.seq << ","
+				<< scan.points.size() << ","
+				<< filtered_scan_ptr->size() << ","
 				<< step_size << ","
 				<< trans_eps << ","
 				<< voxel_leaf_size << ","
@@ -666,6 +734,10 @@ static void scan_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 		previous_velocity = current_velocity;
 		previous_acceleration = current_acceleration;
 		previous_estimated_vel_kmph.data = estimated_vel_kmph.data;
+
+		delete[] w_point;
+		delete[] w_cumulative;
+
 	}
 }
 
@@ -679,6 +751,8 @@ int main(int argc, char **argv)
 	// setting parameters
 	private_nh.getParam("use_gnss", _use_gnss);
 	private_nh.getParam("queue_size", _queue_size);
+	private_nh.getParam("downsampling_method", _downsampling_method);
+	private_nh.getParam("sample_num", _sample_num);
 
 	if(nh.getParam("localizer", _localizer) == false){
 		std::cout << "localizer is not set." << std::endl;
@@ -711,12 +785,11 @@ int main(int argc, char **argv)
 	}
 
 	std::cout << "_localizer: " << _localizer << std::endl;
-	std::cout << "_tf_x: " << _tf_x << std::endl;
-	std::cout << "_tf_y: " << _tf_y << std::endl;
-	std::cout << "_tf_z: " << _tf_z << std::endl;
-	std::cout << "_tf_roll: " << _tf_roll << std::endl;
-	std::cout << "_tf_pitch: " << _tf_pitch << std::endl;
-	std::cout << "_tf_yaw: " << _tf_yaw << std::endl;
+	std::cout << "_downsampling_method: " << _downsampling_method << std::endl;
+	std::cout << "_sample_num: " << _sample_num << std::endl;
+	std::cout << "(_tf_x,_tf_y,_tf_z,_tf_roll,_tf_pitch,_tf_yaw):" << std::endl;
+	std::cout << "(" << _tf_x << ", " << _tf_y << ", " << _tf_z << ", "
+			<< _tf_roll << ", " << _tf_pitch << ", " << _tf_yaw << ")" << std::endl;
 
 	Eigen::Translation3f tl_btol(_tf_x, _tf_y, _tf_z); // tl: translation
 	Eigen::AngleAxisf rot_x_btol(_tf_roll, Eigen::Vector3f::UnitX()); //rot: rotation
@@ -750,6 +823,8 @@ int main(int argc, char **argv)
 	time_ndt_matching_pub = nh.advertise<std_msgs::Float32>("/time_ndt_matching", 1000);
 	ndt_stat_pub = nh.advertise<ndt_localizer::ndt_stat>("/ndt_stat", 1000);
 	ndt_reliability_pub = nh.advertise<std_msgs::Float32>("/ndt_reliability", 1000);
+
+	sampled_scan_pub = nh.advertise<sensor_msgs::PointCloud2>("/sampled_points", 1000);
 
 	// Subscribers
 	ros::Subscriber param_sub = nh.subscribe("config/ndt", 10, param_callback);
